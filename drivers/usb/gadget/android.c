@@ -64,6 +64,7 @@
 #include "rndis.c"
 #include "f_diag.c"
 #include "f_dm.c"
+#include "f_fs.c"
 
 MODULE_AUTHOR("Mike Lockwood");
 MODULE_DESCRIPTION("Android Composite USB Driver");
@@ -125,6 +126,9 @@ struct android_dev {
 	bool connected;
 	bool sw_connected;
 	struct work_struct work;
+
+	char ffs_aliases[256];
+
 };
 
 static struct class *android_class;
@@ -1084,6 +1088,162 @@ static struct android_usb_function audio_source_function = {
 	.attributes	= audio_source_function_attributes,
 };
 
+/* functionfs */
+struct functionfs_config {
+	bool opened;
+	bool enabled;
+	struct ffs_data *data;
+};
+
+static int functionfs_check_dev_callback(const char *dev_name)
+{
+	return 0;
+}
+
+static int ffs_function_init(struct android_usb_function *f,
+				struct usb_composite_dev *cdev)
+{
+	if(!_android_dev)
+		_android_dev = cdev_to_android_dev(cdev);
+
+	f->config = kzalloc(sizeof(struct functionfs_config), GFP_KERNEL);
+	if (!f->config)
+		return -ENOMEM;
+
+	return functionfs_init();
+}
+
+static void ffs_function_cleanup(struct android_usb_function *f)
+{
+	functionfs_cleanup();
+	kfree(f->config);
+	_android_dev = NULL;
+}
+
+static void ffs_function_enable(struct android_usb_function *f)
+{
+	struct android_dev *dev = _android_dev;
+	struct functionfs_config *config = f->config;
+
+	config->enabled = true;
+
+	/* Disable the gadget until the function is ready */
+	if (!config->opened)
+		android_disable(dev);
+}
+
+static void ffs_function_disable(struct android_usb_function *f)
+{
+	struct android_dev *dev = _android_dev;
+	struct functionfs_config *config = f->config;
+
+	config->enabled = false;
+
+	/* Balance the disable that was called in closed_callback */
+	if (!config->opened)
+		android_enable(dev);
+}
+
+static int ffs_function_bind_config(struct android_usb_function *f,
+				struct usb_configuration *c)
+{
+	struct functionfs_config *config = f->config;
+	return functionfs_bind_config(c->cdev, c, config->data);
+}
+
+static ssize_t
+ffs_aliases_show(struct device *pdev, struct device_attribute *attr, char *buf)
+{
+	struct android_dev *dev = _android_dev;
+	int ret;
+
+	mutex_lock(&dev->mutex);
+	ret = sprintf(buf, "%s\n", dev->ffs_aliases);
+	mutex_unlock(&dev->mutex);
+
+	return ret;
+}
+
+static ssize_t
+ffs_aliases_store(struct device *pdev, struct device_attribute *attr,
+					const char *buf, size_t size)
+{
+	struct android_dev *dev = _android_dev;
+	char buff[256];
+
+	mutex_lock(&dev->mutex);
+
+	if (dev->enabled) {
+		mutex_unlock(&dev->mutex);
+		return -EBUSY;
+	}
+
+	strlcpy(buff, buf, sizeof(buff));
+	strlcpy(dev->ffs_aliases, strim(buff), sizeof(dev->ffs_aliases));
+
+	mutex_unlock(&dev->mutex);
+
+	return size;
+}
+
+static DEVICE_ATTR(aliases, S_IRUGO | S_IWUSR, ffs_aliases_show,
+						ffs_aliases_store);
+static struct device_attribute *ffs_function_attributes[] = {
+	&dev_attr_aliases,
+	NULL
+};
+
+static struct android_usb_function ffs_function = {
+	.name		= "ffs",
+	.init		= ffs_function_init,
+	.enable		= ffs_function_enable,
+	.disable	= ffs_function_disable,
+	.cleanup	= ffs_function_cleanup,
+	.bind_config	= ffs_function_bind_config,
+	.attributes	= ffs_function_attributes,
+};
+
+static int functionfs_ready_callback(struct ffs_data *ffs)
+{
+	struct android_dev *dev = _android_dev;
+	struct functionfs_config *config = ffs_function.config;
+	int ret = 0;
+
+	mutex_lock(&dev->mutex);
+
+	ret = functionfs_bind(ffs, dev->cdev);
+	if (ret)
+		goto err;
+
+	config->data = ffs;
+	config->opened = true;
+
+	if (config->enabled)
+		android_enable(dev);
+
+err:
+	mutex_unlock(&dev->mutex);
+	return ret;
+}
+
+static void functionfs_closed_callback(struct ffs_data *ffs)
+{
+	struct android_dev *dev =_android_dev;
+	struct functionfs_config *config = ffs_function.config;
+
+	mutex_lock(&dev->mutex);
+
+	if (config->enabled)
+		android_disable(dev);
+
+	config->opened = false;
+	config->data = NULL;
+
+	functionfs_unbind(ffs);
+
+	mutex_unlock(&dev->mutex);
+}
+
 static struct android_usb_function *supported_functions[] = {
 	&adb_function,
 	&acm_function,
@@ -1098,6 +1258,7 @@ static struct android_usb_function *supported_functions[] = {
 	&diag_function,
 	&dm_function,
 	&audio_source_function,
+	&ffs_function,
 	NULL
 };
 
@@ -1244,9 +1405,12 @@ functions_store(struct device *pdev, struct device_attribute *attr,
 			       const char *buff, size_t size)
 {
 	struct android_dev *dev = dev_get_drvdata(pdev);
-	char *name;
+	char *name = NULL;
+	char aliases[256], *a;
 	char buf[256], *b;
 	int err;
+	    int is_ffs;
+	    int ffs_enabled = 0;
 
 	mutex_lock(&dev->mutex);
 
@@ -1266,30 +1430,34 @@ functions_store(struct device *pdev, struct device_attribute *attr,
 
 	while (b) {
 		name = strsep(&b, ",");
-		if (name) {
-#ifdef CONFIG_USB_ANDROID_SAMSUNG_COMPOSITE
-			/* Enable ncm function */
-			if (is_ncm_ready(name)) {
-				printk(KERN_DEBUG "usb: %s ncm on\n",
-						__func__);
-				err = android_enable_function(dev,
-						"ncm");
+		if (!name)
+		continue;
+
+		is_ffs = 0;
+		strlcpy(aliases, dev->ffs_aliases, sizeof(aliases));
+		a = aliases;
+
+		while (a) {
+			char *alias = strsep(&a, ",");
+			if (alias && !strcmp(name, alias)) {
+				is_ffs = 1;
+				break;
+			}
+		}
+
+		if (is_ffs) {
+			if (ffs_enabled)
 				continue;
-			}
-#endif
-			err = android_enable_function(dev, name);
-			if (err)
-				pr_err("android_usb: Cannot enable '%s'", name);
-#ifdef CONFIG_USB_ANDROID_SAMSUNG_COMPOSITE
-			/* Enable ACM function, if MTP is enabled. */
-			if (!strcmp(name, "mtp")) {
-				err = android_enable_function(dev, "acm");
-				if (err)
-					pr_err(
-					"android_usb: Cannot enable '%s'",
-					name);
-			}
-#endif
+				err = android_enable_function(dev, conf, "ffs");
+		if (err)
+			pr_err("android_usb: Cannot enable ffs (%d)", err);
+		else
+			ffs_enabled = 1;
+		    continue;
+		}
+		err = android_enable_function(dev, conf, name);
+		if (err)
+			pr_err("android_usb: Cannot enable %s (%d)", name, err);
 		}
 	}
 
